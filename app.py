@@ -1,11 +1,12 @@
 """
 気象レポートPDF 降水量ハイライター
-Streamlit Cloud用 - このファイル1つをGitHubに置くだけで動きます
+複数PDF同時アップロード対応版
 """
 
 import streamlit as st
 import tempfile
 import os
+import zipfile
 from itertools import groupby
 
 import pdfplumber
@@ -38,6 +39,17 @@ st.markdown("""
         padding: 20px;
         text-align: center;
         margin: 16px 0;
+    }
+    .file-row {
+        background: #f4f9fd;
+        border: 1px solid #cde4f5;
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin: 6px 0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 13px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -85,7 +97,6 @@ def extract_rainfall_groups(pdf_path):
                 except ValueError:
                     pass
 
-            # 隣接するセルをグループ化
             groups = []
             boxes_sorted = sorted(rainfall_boxes, key=lambda c: (c['row_top'], c['x0']))
             for _, row_boxes in groupby(boxes_sorted, key=lambda c: c['row_top']):
@@ -111,11 +122,7 @@ def extract_rainfall_groups(pdf_path):
 def draw_highlights(input_path, output_path, page_groups):
     """水色の枠線＋薄い水色塗りつぶし（Multiplyブレンドで数字を透過）"""
     doc = pdfium.PdfDocument(input_path)
-
-    SKY_R, SKY_G, SKY_B = 0, 176, 240   # 水色
-    FILL_ALPHA = 40                       # 塗りつぶしの透明度（0〜255、小さいほど薄い）
-    STROKE_ALPHA = 255                    # 枠線は不透明
-    STROKE_WIDTH = 1.5
+    SKY_R, SKY_G, SKY_B = 0, 176, 240
 
     for pg in page_groups:
         page = doc[pg['page_num']]
@@ -128,28 +135,18 @@ def draw_highlights(input_path, output_path, page_groups):
             gtop = min(c['top'] for c in group)
             gbottom = max(c['bottom'] for c in group)
 
-            # pdfplumber座標（左上原点）→ PDF座標（左下原点）
             pdf_x0 = gx0
             pdf_y0 = pdf_h - gbottom * (pdf_h / pl_h)
             pdf_y1 = pdf_h - gtop * (pdf_h / pl_h)
-            w = gx1 - gx0
-            h = pdf_y1 - pdf_y0
 
-            rect = pdfium_c.FPDFPageObj_CreateNewRect(pdf_x0, pdf_y0, w, h)
-
-            # 薄い水色で塗りつぶし（Multiplyブレンドで下のテキストを透過）
-            pdfium_c.FPDFPageObj_SetFillColor(rect, SKY_R, SKY_G, SKY_B, FILL_ALPHA)
-
-            # 水色の枠線（不透明）
-            pdfium_c.FPDFPageObj_SetStrokeColor(rect, SKY_R, SKY_G, SKY_B, STROKE_ALPHA)
-            pdfium_c.FPDFPageObj_SetStrokeWidth(rect, STROKE_WIDTH)
-
-            # 塗りつぶし＋枠線を両方描画
+            rect = pdfium_c.FPDFPageObj_CreateNewRect(
+                pdf_x0, pdf_y0, gx1 - gx0, pdf_y1 - pdf_y0
+            )
+            pdfium_c.FPDFPageObj_SetFillColor(rect, SKY_R, SKY_G, SKY_B, 40)
+            pdfium_c.FPDFPageObj_SetStrokeColor(rect, SKY_R, SKY_G, SKY_B, 255)
+            pdfium_c.FPDFPageObj_SetStrokeWidth(rect, 1.5)
             pdfium_c.FPDFPath_SetDrawMode(rect, 1, 1)
-
-            # Multiplyブレンドモードで下のコンテンツ（数字）を透過
             pdfium_c.FPDFPageObj_SetBlendMode(rect, b"Multiply")
-
             pdfium_c.FPDFPage_InsertObject(page.raw, rect)
 
         pdfium_c.FPDFPage_GenerateContent(page.raw)
@@ -157,61 +154,143 @@ def draw_highlights(input_path, output_path, page_groups):
     doc.save(output_path)
 
 
+def process_single_pdf(uploaded_file, tmpdir):
+    """1つのPDFを処理して出力バイト列と統計を返す"""
+    input_path = os.path.join(tmpdir, "input.pdf")
+    output_path = os.path.join(tmpdir, uploaded_file.name)
+
+    with open(input_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    page_groups = extract_rainfall_groups(input_path)
+    total_cells = sum(len(g) for pg in page_groups for g in pg['groups'])
+    total_groups = sum(len(pg['groups']) for pg in page_groups)
+
+    if total_cells == 0:
+        return None, 0, 0
+
+    draw_highlights(input_path, output_path, page_groups)
+
+    with open(output_path, "rb") as f:
+        output_bytes = f.read()
+
+    return output_bytes, total_cells, total_groups
+
+
 # ---------- 画面 ----------
 
 st.title("🌧️ 降水量ハイライター")
-st.caption("気象レポートのPDFをアップロードすると、降水量が0より大きいセルを水色の枠と薄い水色でハイライトします。")
+st.caption("気象レポートのPDFをアップロードすると、降水量が0より大きいセルを水色の枠と薄い水色でハイライトします。複数ファイルの同時処理に対応しています。")
 
 st.divider()
 
-uploaded_file = st.file_uploader(
-    "気象レポートのPDFを選択してください",
+uploaded_files = st.file_uploader(
+    "気象レポートのPDFを選択してください（複数選択可）",
     type=["pdf"],
-    help="複数ページのPDFにも対応しています"
+    accept_multiple_files=True,
+    help="Ctrl（Mac: Command）を押しながらクリックで複数選択できます"
 )
 
-if uploaded_file:
-    st.success(f"✅ {uploaded_file.name}（{uploaded_file.size / 1024:.0f} KB）")
+if uploaded_files:
+    # アップロード済みファイル一覧
+    st.markdown(f"**{len(uploaded_files)} 件のファイルが選択されています**")
+    for f in uploaded_files:
+        st.markdown(f"""
+        <div class="file-row">
+            📄 {f.name} <span style="color:#6b8aad; margin-left:auto">{f.size / 1024:.0f} KB</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-    if st.button("⚡ ハイライト処理を実行"):
-        with st.spinner("処理中です。しばらくお待ちください…"):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                input_path = os.path.join(tmpdir, "input.pdf")
-                output_path = os.path.join(tmpdir, "output.pdf")
+    st.markdown("")
 
-                with open(input_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
+    if st.button("⚡ まとめてハイライト処理を実行"):
+        results = []
+        errors = []
+
+        progress_bar = st.progress(0, text="処理中...")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i, uploaded_file in enumerate(uploaded_files):
+                progress_bar.progress(
+                    (i) / len(uploaded_files),
+                    text=f"処理中 ({i+1}/{len(uploaded_files)}): {uploaded_file.name}"
+                )
 
                 try:
-                    page_groups = extract_rainfall_groups(input_path)
-                    total_cells = sum(len(g) for pg in page_groups for g in pg['groups'])
-                    total_groups = sum(len(pg['groups']) for pg in page_groups)
-
-                    if total_cells == 0:
-                        st.error("降水量データが見つかりませんでした。気象レポートのPDFか確認してください。")
+                    output_bytes, total_cells, total_groups = process_single_pdf(
+                        uploaded_file, tmpdir
+                    )
+                    if output_bytes is None:
+                        errors.append(f"{uploaded_file.name}：降水量データが見つかりませんでした")
                     else:
-                        draw_highlights(input_path, output_path, page_groups)
-
-                        with open(output_path, "rb") as f:
-                            output_bytes = f.read()
-
-                        st.markdown(f"""
-                        <div class="result-box">
-                            <h3 style="color:#00c896; margin:0 0 8px">✓ 処理完了！</h3>
-                            <p style="color:#6b8aad; margin:0">{total_cells} セル検出 / {total_groups} グループでハイライト</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-
                         out_name = uploaded_file.name.replace(".pdf", "_ハイライト済.pdf")
-                        st.download_button(
-                            label="📥 ハイライト済PDFをダウンロード",
-                            data=output_bytes,
-                            file_name=out_name,
-                            mime="application/pdf"
-                        )
-
+                        results.append({
+                            'name': uploaded_file.name,
+                            'out_name': out_name,
+                            'bytes': output_bytes,
+                            'cells': total_cells,
+                            'groups': total_groups
+                        })
                 except Exception as e:
-                    st.error(f"処理中にエラーが発生しました: {e}")
+                    errors.append(f"{uploaded_file.name}：エラー ({e})")
+
+            progress_bar.progress(1.0, text="完了！")
+
+            # エラー表示
+            for err in errors:
+                st.error(f"⚠️ {err}")
+
+            if results:
+                total_files = len(results)
+
+                st.markdown(f"""
+                <div class="result-box">
+                    <h3 style="color:#00c896; margin:0 0 8px">✓ {total_files} 件の処理が完了しました！</h3>
+                    <p style="color:#6b8aad; margin:0">合計 {sum(r['cells'] for r in results)} セルをハイライト</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # ファイルが1つの場合：そのままダウンロード
+                if total_files == 1:
+                    r = results[0]
+                    st.download_button(
+                        label=f"📥 {r['out_name']} をダウンロード",
+                        data=r['bytes'],
+                        file_name=r['out_name'],
+                        mime="application/pdf"
+                    )
+
+                # 複数ファイルの場合：ZIP でまとめてダウンロード
+                else:
+                    zip_path = os.path.join(tmpdir, "ハイライト済み_一括.zip")
+                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        for r in results:
+                            zf.writestr(r['out_name'], r['bytes'])
+
+                    with open(zip_path, "rb") as f:
+                        zip_bytes = f.read()
+
+                    st.download_button(
+                        label=f"📦 {total_files} 件をZIPでまとめてダウンロード",
+                        data=zip_bytes,
+                        file_name="ハイライト済み_一括.zip",
+                        mime="application/zip"
+                    )
+
+                    # 個別ダウンロードも表示
+                    with st.expander("📄 個別にダウンロードする"):
+                        for r in results:
+                            col1, col2 = st.columns([3, 1])
+                            with col1:
+                                st.caption(f"{r['out_name']}（{r['cells']}セル / {r['groups']}グループ）")
+                            with col2:
+                                st.download_button(
+                                    label="DL",
+                                    data=r['bytes'],
+                                    file_name=r['out_name'],
+                                    mime="application/pdf",
+                                    key=r['name']
+                                )
 
 st.divider()
-st.caption("📌 使い方：PDFを選択 → 実行ボタン → ダウンロード")
+st.caption("📌 使い方：PDFを選択（複数可）→ 実行ボタン → ダウンロード")
