@@ -12,17 +12,14 @@ import pdfplumber
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
-# ページ設定
 st.set_page_config(
     page_title="降水量ハイライター",
     page_icon="🌧️",
     layout="centered"
 )
 
-# スタイル
 st.markdown("""
 <style>
-    .main { max-width: 700px; margin: 0 auto; }
     .stButton > button {
         width: 100%;
         background: linear-gradient(135deg, #00B0F0, #0097d6);
@@ -49,7 +46,9 @@ st.markdown("""
 # ---------- PDF処理ロジック ----------
 
 def extract_rainfall_groups(pdf_path):
+    """pdfplumberでセル境界と降水量データを正確に取得してグループ化"""
     page_groups = []
+
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages):
             words = page.extract_words()
@@ -86,6 +85,7 @@ def extract_rainfall_groups(pdf_path):
                 except ValueError:
                     pass
 
+            # 隣接するセルをグループ化
             groups = []
             boxes_sorted = sorted(rainfall_boxes, key=lambda c: (c['row_top'], c['x0']))
             for _, row_boxes in groupby(boxes_sorted, key=lambda c: c['row_top']):
@@ -109,8 +109,13 @@ def extract_rainfall_groups(pdf_path):
 
 
 def draw_highlights(input_path, output_path, page_groups):
+    """水色の枠線＋薄い水色塗りつぶし（Multiplyブレンドで数字を透過）"""
     doc = pdfium.PdfDocument(input_path)
-    SKY_R, SKY_G, SKY_B = 0, 176, 240
+
+    SKY_R, SKY_G, SKY_B = 0, 176, 240   # 水色
+    FILL_ALPHA = 40                       # 塗りつぶしの透明度（0〜255、小さいほど薄い）
+    STROKE_ALPHA = 255                    # 枠線は不透明
+    STROKE_WIDTH = 1.5
 
     for pg in page_groups:
         page = doc[pg['page_num']]
@@ -123,16 +128,28 @@ def draw_highlights(input_path, output_path, page_groups):
             gtop = min(c['top'] for c in group)
             gbottom = max(c['bottom'] for c in group)
 
+            # pdfplumber座標（左上原点）→ PDF座標（左下原点）
             pdf_x0 = gx0
             pdf_y0 = pdf_h - gbottom * (pdf_h / pl_h)
             pdf_y1 = pdf_h - gtop * (pdf_h / pl_h)
+            w = gx1 - gx0
+            h = pdf_y1 - pdf_y0
 
-            rect = pdfium_c.FPDFPageObj_CreateNewRect(
-                pdf_x0, pdf_y0, gx1 - gx0, pdf_y1 - pdf_y0
-            )
-            pdfium_c.FPDFPageObj_SetStrokeColor(rect, SKY_R, SKY_G, SKY_B, 255)
-            pdfium_c.FPDFPageObj_SetStrokeWidth(rect, 1.5)
-            pdfium_c.FPDFPath_SetDrawMode(rect, 0, 1)
+            rect = pdfium_c.FPDFPageObj_CreateNewRect(pdf_x0, pdf_y0, w, h)
+
+            # 薄い水色で塗りつぶし（Multiplyブレンドで下のテキストを透過）
+            pdfium_c.FPDFPageObj_SetFillColor(rect, SKY_R, SKY_G, SKY_B, FILL_ALPHA)
+
+            # 水色の枠線（不透明）
+            pdfium_c.FPDFPageObj_SetStrokeColor(rect, SKY_R, SKY_G, SKY_B, STROKE_ALPHA)
+            pdfium_c.FPDFPageObj_SetStrokeWidth(rect, STROKE_WIDTH)
+
+            # 塗りつぶし＋枠線を両方描画
+            pdfium_c.FPDFPath_SetDrawMode(rect, 1, 1)
+
+            # Multiplyブレンドモードで下のコンテンツ（数字）を透過
+            pdfium_c.FPDFPageObj_SetBlendMode(rect, b"Multiply")
+
             pdfium_c.FPDFPage_InsertObject(page.raw, rect)
 
         pdfium_c.FPDFPage_GenerateContent(page.raw)
@@ -143,7 +160,7 @@ def draw_highlights(input_path, output_path, page_groups):
 # ---------- 画面 ----------
 
 st.title("🌧️ 降水量ハイライター")
-st.caption("気象レポートのPDFをアップロードすると、降水量が0より大きいセルを水色の枠で自動ハイライトします。")
+st.caption("気象レポートのPDFをアップロードすると、降水量が0より大きいセルを水色の枠と薄い水色でハイライトします。")
 
 st.divider()
 
