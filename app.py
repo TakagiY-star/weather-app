@@ -1,7 +1,7 @@
 """
 気象レポートPDF 降水量ハイライター
 - 降水量セルをハイライト
-- 1〜4日目の1時間予報をJPGとしてトリミング出力
+- 1〜4日目の1時間予報をPNGとしてトリミング出力
 """
 
 import streamlit as st
@@ -15,7 +15,6 @@ import pdfplumber
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 from PIL import Image, ImageChops
-import numpy as np
 
 st.set_page_config(
     page_title="降水量ハイライター",
@@ -146,10 +145,7 @@ def draw_highlights(input_path, output_path, page_groups):
 
 
 def find_forecast_crop_top(pdf_path):
-    """
-    pdfplumberで「現在から24時」または「日付」テキストの位置を検出し、
-    1時間予報エリアのクロップ開始位置(pt)を返す
-    """
+    """「現在から24時」または「日付」の位置を検出してクロップ上端(pt)を返す"""
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[0]
         words = page.extract_words()
@@ -163,10 +159,7 @@ def find_forecast_crop_top(pdf_path):
 
 
 def find_forecast_crop_bottom(pdf_path):
-    """
-    4日目の最終行（風のm/s行）下端をpdfplumberで検出し、
-    クロップ終了位置(pt)を返す
-    """
+    """4日目の最終行（m/s行）の下端を検出してクロップ下端(pt)を返す"""
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[0]
         words = page.extract_words()
@@ -196,10 +189,10 @@ def trim_whitespace(img, margin=5):
     ))
 
 
-def crop_forecast_jpg(pdf_path, dpi=300):
+def crop_forecast_png(pdf_path, dpi=300):
     """
     ハイライト済みPDFから1〜4日目の1時間予報エリアを
-    動的に検出してトリミングし、JPG画像バイト列を返す
+    動的に検出してトリミングし、PNG画像バイト列を返す
     """
     crop_top_pt = find_forecast_crop_top(pdf_path)
     crop_bottom_pt = find_forecast_crop_bottom(pdf_path)
@@ -212,19 +205,18 @@ def crop_forecast_jpg(pdf_path, dpi=300):
     img = bitmap.to_pil()
 
     px_top = int(crop_top_pt * scale)
-    px_bottom = int(crop_bottom_pt * scale)
-    px_bottom = min(px_bottom, img.height)
+    px_bottom = min(int(crop_bottom_pt * scale), img.height)
 
     cropped = img.crop((0, px_top, img.width, px_bottom))
     trimmed = trim_whitespace(cropped, margin=5)
 
     buf = io.BytesIO()
-    trimmed.save(buf, format="JPEG", quality=95)
+    trimmed.save(buf, format="PNG")
     return buf.getvalue()
 
 
 def process_pdf(uploaded_file, tmpdir, dpi):
-    """PDFを処理してハイライト済みPDFと1時間予報JPGを返す"""
+    """PDFを処理してハイライト済みPDFと1時間予報PNGを返す"""
     input_path = os.path.join(tmpdir, "input.pdf")
     highlighted_path = os.path.join(tmpdir, "highlighted.pdf")
     base_name = os.path.splitext(uploaded_file.name)[0]
@@ -244,9 +236,9 @@ def process_pdf(uploaded_file, tmpdir, dpi):
     with open(highlighted_path, "rb") as f:
         highlighted_bytes = f.read()
 
-    jpg_bytes = crop_forecast_jpg(highlighted_path, dpi=dpi)
+    png_bytes = crop_forecast_png(highlighted_path, dpi=dpi)
 
-    return highlighted_bytes, jpg_bytes, total_cells, total_groups
+    return highlighted_bytes, png_bytes, total_cells, total_groups
 
 
 # ============================================================
@@ -254,7 +246,7 @@ def process_pdf(uploaded_file, tmpdir, dpi):
 # ============================================================
 
 st.title("🌧️ 降水量ハイライター")
-st.caption("気象レポートPDFの降水量をハイライトし、1〜4日目の1時間予報をJPGで切り抜きます。")
+st.caption("気象レポートPDFの降水量をハイライトし、1〜4日目の1時間予報をPNGで切り抜きます。")
 
 st.divider()
 
@@ -277,10 +269,10 @@ if uploaded_files:
     st.markdown("")
 
     dpi = st.select_slider(
-        "JPG画質（DPI）",
-        options=[150, 200, 300],
+        "画質（DPI）",
+        options=[150, 200, 300, 400, 600],
         value=300,
-        help="300が最高画質です"
+        help="数値が大きいほど高画質・ファイルサイズ大。通常は300で十分です"
     )
 
     if st.button("⚡ ハイライト＆切り抜きを実行"):
@@ -295,7 +287,7 @@ if uploaded_files:
                     text=f"処理中 ({i+1}/{len(uploaded_files)}): {uploaded_file.name}"
                 )
                 try:
-                    highlighted_bytes, jpg_bytes, total_cells, total_groups = process_pdf(
+                    highlighted_bytes, png_bytes, total_cells, total_groups = process_pdf(
                         uploaded_file, tmpdir, dpi
                     )
                     if highlighted_bytes is None:
@@ -306,7 +298,7 @@ if uploaded_files:
                             "source": uploaded_file.name,
                             "base_name": base_name,
                             "highlighted_bytes": highlighted_bytes,
-                            "jpg_bytes": jpg_bytes,
+                            "png_bytes": png_bytes,
                             "cells": total_cells,
                             "groups": total_groups
                         })
@@ -339,17 +331,17 @@ if uploaded_files:
                     )
                 with col2:
                     st.download_button(
-                        label="📥 1時間予報JPG",
-                        data=r["jpg_bytes"],
-                        file_name=f"{r['base_name']}_1時間予報.jpg",
-                        mime="image/jpeg"
+                        label="📥 1時間予報PNG",
+                        data=r["png_bytes"],
+                        file_name=f"{r['base_name']}_1時間予報.png",
+                        mime="image/png"
                     )
             else:
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for r in results:
                         zf.writestr(f"{r['base_name']}_ハイライト済.pdf", r["highlighted_bytes"])
-                        zf.writestr(f"{r['base_name']}_1時間予報.jpg", r["jpg_bytes"])
+                        zf.writestr(f"{r['base_name']}_1時間予報.png", r["png_bytes"])
                 zip_buf.seek(0)
 
                 st.download_button(
@@ -373,12 +365,12 @@ if uploaded_files:
                             )
                         with col2:
                             st.download_button(
-                                label="JPG",
-                                data=r["jpg_bytes"],
-                                file_name=f"{r['base_name']}_1時間予報.jpg",
-                                mime="image/jpeg",
-                                key=f"jpg_{r['source']}"
+                                label="PNG",
+                                data=r["png_bytes"],
+                                file_name=f"{r['base_name']}_1時間予報.png",
+                                mime="image/png",
+                                key=f"png_{r['source']}"
                             )
 
 st.divider()
-st.caption("使い方：PDFをアップロード -> 実行 -> ハイライト済PDF と 1時間予報JPG をダウンロード")
+st.caption("使い方：PDFをアップロード -> 実行 -> ハイライト済PDF と 1時間予報PNG をダウンロード")
