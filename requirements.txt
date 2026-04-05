@@ -2,5 +2,3 @@ streamlit
 pdfplumber
 pypdfium2
 pillow
-openpyxl
-pypdf
