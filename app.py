@@ -1,6 +1,6 @@
 """
 気象レポートPDF 降水量ハイライター
-複数PDF・PDF/JPG出力・週間天気予報PDF生成対応版
+複数PDF・PDF/JPG出力・週間天気予報PDF生成・PDF合体対応版
 """
 
 import streamlit as st
@@ -17,6 +17,7 @@ import pypdfium2.raw as pdfium_c
 from PIL import Image, ImageChops
 import openpyxl
 from openpyxl.drawing.image import Image as XLImage
+from pypdf import PdfWriter, PdfReader
 
 st.set_page_config(
     page_title="降水量ハイライター",
@@ -167,7 +168,6 @@ def pdf_to_jpg_bytes(pdf_path, dpi=150):
 
 
 def trim_whitespace(img, margin=5):
-    """白い余白を自動検出してトリミング"""
     bg = Image.new("RGB", img.size, (255, 255, 255))
     diff = ImageChops.difference(img, bg)
     bbox = diff.getbbox()
@@ -181,7 +181,6 @@ def trim_whitespace(img, margin=5):
 
 
 def crop_forecast_image(pdf_path, dpi=200):
-    """1〜4日目の1時間予報エリアを切り取り・余白トリミングして返す"""
     doc = pdfium.PdfDocument(pdf_path)
     page = doc[0]
     scale = dpi / 72
@@ -194,11 +193,6 @@ def crop_forecast_image(pdf_path, dpi=200):
 
 
 def embed_to_excel(highlighted_pdf_path, template_bytes, tmpdir):
-    """
-    ハイライト済みPDFから1〜4日目エリアを切り取り、
-    出力シート24行目以降に貼り付けてxlsmを保存
-    戻り値: (xlsm_path, xlsm_bytes)
-    """
     crop_img = crop_forecast_image(highlighted_pdf_path, dpi=200)
     img_path = os.path.join(tmpdir, "forecast_crop.png")
     crop_img.save(img_path, "PNG")
@@ -210,13 +204,11 @@ def embed_to_excel(highlighted_pdf_path, template_bytes, tmpdir):
     wb = openpyxl.load_workbook(template_path, keep_vba=True)
     ws = wb['出力']
 
-    # 24行目以降の既存画像を削除
     ws._images = [
         im for im in ws._images
         if hasattr(im.anchor, '_from') and im.anchor._from.row < 23
     ]
 
-    # 確定値 1280px（実測から逆算済み、AE列ぴったり）
     TARGET_WIDTH_PX = 1280
     orig_w, orig_h = crop_img.size
     ratio = TARGET_WIDTH_PX / orig_w
@@ -238,35 +230,39 @@ def embed_to_excel(highlighted_pdf_path, template_bytes, tmpdir):
 
 
 def excel_to_pdf(xlsm_path, tmpdir):
-    """
-    LibreOfficeを使ってExcelの出力シートをPDF化する
-    戻り値: pdf_bytes または None（失敗時）
-    """
     try:
-        # LibreOfficeでxlsm→PDF変換（出力シートのみ）
-        result = subprocess.run(
-            [
-                "libreoffice", "--headless",
-                "--convert-to", "pdf",
-                "--outdir", tmpdir,
-                xlsm_path
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60
+        wb = openpyxl.load_workbook(xlsm_path, keep_vba=True)
+        for sheet_name in wb.sheetnames:
+            if sheet_name != '出力':
+                wb[sheet_name].sheet_state = 'hidden'
+
+        xlsx_path = os.path.join(tmpdir, "for_pdf.xlsx")
+        wb.save(xlsx_path)
+
+        subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", tmpdir, xlsx_path],
+            capture_output=True, text=True, timeout=60
         )
 
-        # 生成されたPDFを探す
-        base_name = os.path.splitext(os.path.basename(xlsm_path))[0]
-        pdf_path = os.path.join(tmpdir, base_name + ".pdf")
-
+        pdf_path = os.path.join(tmpdir, "for_pdf.pdf")
         if os.path.exists(pdf_path):
             with open(pdf_path, "rb") as f:
                 return f.read()
         return None
-
     except Exception:
         return None
+
+
+def merge_pdfs(pdf_bytes_list):
+    """複数のPDFバイト列を順番に結合して返す"""
+    writer = PdfWriter()
+    for pdf_bytes in pdf_bytes_list:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            writer.add_page(page)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
 
 
 def process_single_pdf(uploaded_file, tmpdir, output_format, dpi=150):
@@ -327,188 +323,237 @@ st.divider()
 st.markdown('<div class="section-title">処理モードを選択</div>', unsafe_allow_html=True)
 mode = st.radio(
     label="モード",
-    options=["📄 ハイライトのみ", "📊 週間天気予報PDFも作成"],
+    options=["📄 ハイライトのみ", "📊 週間天気予報PDFも作成", "📎 PDFを合体させる"],
     label_visibility="collapsed",
     horizontal=True
 )
 
 st.divider()
 
-# ファイルアップロード
-st.markdown('<div class="section-title">① 気象レポートPDFをアップロード</div>', unsafe_allow_html=True)
-uploaded_files = st.file_uploader(
-    "気象レポートのPDFを選択してください（複数選択可）",
-    type=["pdf"],
-    accept_multiple_files=True,
-    help="Ctrl（Mac: Command）を押しながらクリックで複数選択できます"
-)
-
-template_file = None
-if mode == "📊 週間天気予報PDFも作成":
-    st.markdown('<div class="section-title">② 週間天気予報テンプレートをアップロード</div>', unsafe_allow_html=True)
-    template_file = st.file_uploader(
-        "週間天気予報.xlsm を選択してください",
-        type=["xlsm", "xlsx"],
-        help="毎回同じテンプレートファイルを使用します"
+# ============================================================
+# モード：PDFを合体させる
+# ============================================================
+if mode == "📎 PDFを合体させる":
+    st.markdown('<div class="section-title">① 週間天気予報PDF（出力シートをPDF化したもの）</div>', unsafe_allow_html=True)
+    weekly_pdf_file = st.file_uploader(
+        "週間天気予報のPDFを選択",
+        type=["pdf"],
+        key="weekly_pdf_upload"
     )
 
-if uploaded_files:
-    st.markdown(f"**{len(uploaded_files)} 件のファイルが選択されています**")
-    for f in uploaded_files:
-        st.markdown(f"""
-        <div class="file-row">
-            📄 {f.name}&nbsp;&nbsp;<span style="color:#6b8aad">{f.size / 1024:.0f} KB</span>
-        </div>
-        """, unsafe_allow_html=True)
+    st.markdown('<div class="section-title">② 気象レポートPDF（ハイライト済みでも未処理でも可）</div>', unsafe_allow_html=True)
+    report_pdf_file = st.file_uploader(
+        "気象レポートのPDFを選択",
+        type=["pdf"],
+        key="report_pdf_upload"
+    )
 
     st.markdown("")
 
-    if mode == "📄 ハイライトのみ":
-        st.markdown("**出力形式を選択してください**")
-        output_format = st.radio(
-            label="出力形式",
-            options=["PDF", "JPG"],
+    if weekly_pdf_file and report_pdf_file:
+        st.success(f"✅ {weekly_pdf_file.name}  ＋  {report_pdf_file.name}")
+
+        st.markdown("**合体の順番を選択してください**")
+        order = st.radio(
+            label="順番",
+            options=["週間天気予報 → 気象レポート", "気象レポート → 週間天気予報"],
             horizontal=True,
             label_visibility="collapsed"
         )
-        dpi = st.select_slider(
-            "画質（DPI）",
-            options=[72, 96, 150, 200, 300],
-            value=150,
-            help="JPG選択時のみ有効"
-        ) if output_format == "JPG" else 150
-    else:
-        output_format = "PDF"
-        dpi = 150
 
-    st.markdown("")
+        if st.button("📎 PDFを合体してダウンロード"):
+            with st.spinner("合体中..."):
+                if order == "週間天気予報 → 気象レポート":
+                    pdf_list = [weekly_pdf_file.getbuffer(), report_pdf_file.getbuffer()]
+                else:
+                    pdf_list = [report_pdf_file.getbuffer(), weekly_pdf_file.getbuffer()]
 
-    btn_label = "⚡ ハイライト処理を実行" if mode == "📄 ハイライトのみ" else "⚡ ハイライト＋週間天気予報PDFを作成"
-    run = st.button(btn_label)
+                merged_bytes = merge_pdfs(pdf_list)
 
-    if run:
-        if mode == "📊 週間天気予報PDFも作成" and not template_file:
-            st.error("⚠️ 週間天気予報のテンプレートファイルをアップロードしてください。")
-            st.stop()
-        if mode == "📊 週間天気予報PDFも作成" and len(uploaded_files) > 1:
-            st.error("⚠️ 週間天気予報作成モードは気象レポートを1ファイルずつ処理してください。")
-            st.stop()
+            st.markdown("""
+            <div class="result-box">
+                <h3 style="color:#00c896; margin:0 0 8px">✓ 合体完了！</h3>
+            </div>
+            """, unsafe_allow_html=True)
 
-        all_outputs = []
-        weekly_excel_bytes = None
-        weekly_pdf_bytes = None
-        errors = []
+            st.download_button(
+                label="📥 合体済みPDFをダウンロード",
+                data=merged_bytes,
+                file_name="週間天気予報_完成.pdf",
+                mime="application/pdf"
+            )
 
-        progress_bar = st.progress(0, text="処理中...")
+# ============================================================
+# モード：ハイライトのみ / 週間天気予報PDFも作成
+# ============================================================
+else:
+    st.markdown('<div class="section-title">① 気象レポートPDFをアップロード</div>', unsafe_allow_html=True)
+    uploaded_files = st.file_uploader(
+        "気象レポートのPDFを選択してください（複数選択可）",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Ctrl（Mac: Command）を押しながらクリックで複数選択できます"
+    )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for i, uploaded_file in enumerate(uploaded_files):
-                progress_bar.progress(
-                    i / len(uploaded_files),
-                    text=f"処理中 ({i+1}/{len(uploaded_files)}): {uploaded_file.name}"
-                )
-                try:
-                    outputs, total_cells, total_groups, highlighted_path = process_single_pdf(
-                        uploaded_file, tmpdir, output_format, dpi
+    template_file = None
+    if mode == "📊 週間天気予報PDFも作成":
+        st.markdown('<div class="section-title">② 週間天気予報テンプレートをアップロード</div>', unsafe_allow_html=True)
+        template_file = st.file_uploader(
+            "週間天気予報.xlsm を選択してください",
+            type=["xlsm", "xlsx"],
+            help="毎回同じテンプレートファイルを使用します"
+        )
+
+    if uploaded_files:
+        st.markdown(f"**{len(uploaded_files)} 件のファイルが選択されています**")
+        for f in uploaded_files:
+            st.markdown(f"""
+            <div class="file-row">
+                📄 {f.name}&nbsp;&nbsp;<span style="color:#6b8aad">{f.size / 1024:.0f} KB</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("")
+
+        if mode == "📄 ハイライトのみ":
+            st.markdown("**出力形式を選択してください**")
+            output_format = st.radio(
+                label="出力形式",
+                options=["PDF", "JPG"],
+                horizontal=True,
+                label_visibility="collapsed"
+            )
+            dpi = st.select_slider(
+                "画質（DPI）",
+                options=[72, 96, 150, 200, 300],
+                value=150,
+                help="JPG選択時のみ有効"
+            ) if output_format == "JPG" else 150
+        else:
+            output_format = "PDF"
+            dpi = 150
+
+        st.markdown("")
+
+        btn_label = "⚡ ハイライト処理を実行" if mode == "📄 ハイライトのみ" else "⚡ ハイライト＋週間天気予報を作成"
+        run = st.button(btn_label)
+
+        if run:
+            if mode == "📊 週間天気予報PDFも作成" and not template_file:
+                st.error("⚠️ 週間天気予報のテンプレートファイルをアップロードしてください。")
+                st.stop()
+            if mode == "📊 週間天気予報PDFも作成" and len(uploaded_files) > 1:
+                st.error("⚠️ 週間天気予報作成モードは気象レポートを1ファイルずつ処理してください。")
+                st.stop()
+
+            all_outputs = []
+            weekly_excel_bytes = None
+            weekly_pdf_bytes = None
+            errors = []
+
+            progress_bar = st.progress(0, text="処理中...")
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for i, uploaded_file in enumerate(uploaded_files):
+                    progress_bar.progress(
+                        i / len(uploaded_files),
+                        text=f"処理中 ({i+1}/{len(uploaded_files)}): {uploaded_file.name}"
                     )
-                    if outputs is None:
-                        errors.append(f"{uploaded_file.name}：降水量データが見つかりませんでした")
-                        continue
-
-                    for out in outputs:
-                        all_outputs.append({**out, "cells": total_cells, "groups": total_groups})
-
-                    # 週間天気予報モード
-                    if mode == "📊 週間天気予報PDFも作成" and highlighted_path:
-                        progress_bar.progress(0.6, text="Excelテンプレートに貼り付け中...")
-                        xlsm_path, weekly_excel_bytes = embed_to_excel(
-                            highlighted_path, template_file.getbuffer(), tmpdir
+                    try:
+                        outputs, total_cells, total_groups, highlighted_path = process_single_pdf(
+                            uploaded_file, tmpdir, output_format, dpi
                         )
+                        if outputs is None:
+                            errors.append(f"{uploaded_file.name}：降水量データが見つかりませんでした")
+                            continue
 
-                        progress_bar.progress(0.85, text="PDFに変換中...")
-                        weekly_pdf_bytes = excel_to_pdf(xlsm_path, tmpdir)
+                        for out in outputs:
+                            all_outputs.append({**out, "cells": total_cells, "groups": total_groups})
 
-                except Exception as e:
-                    errors.append(f"{uploaded_file.name}：エラー ({e})")
+                        if mode == "📊 週間天気予報PDFも作成" and highlighted_path:
+                            progress_bar.progress(0.6, text="Excelテンプレートに貼り付け中...")
+                            xlsm_path, weekly_excel_bytes = embed_to_excel(
+                                highlighted_path, template_file.getbuffer(), tmpdir
+                            )
+                            progress_bar.progress(0.85, text="PDFに変換中...")
+                            weekly_pdf_bytes = excel_to_pdf(xlsm_path, tmpdir)
 
-            progress_bar.progress(1.0, text="完了！")
+                    except Exception as e:
+                        errors.append(f"{uploaded_file.name}：エラー ({e})")
 
-            for err in errors:
-                st.error(f"⚠️ {err}")
+                progress_bar.progress(1.0, text="完了！")
 
-            if all_outputs or weekly_excel_bytes:
-                total_files = len(uploaded_files) - len(errors)
-                st.markdown(f"""
-                <div class="result-box">
-                    <h3 style="color:#00c896; margin:0 0 8px">✓ {total_files} 件の処理が完了しました！</h3>
-                    <p style="color:#6b8aad; margin:0">合計 {sum(o['cells'] for o in all_outputs)} セルをハイライト</p>
-                </div>
-                """, unsafe_allow_html=True)
+                for err in errors:
+                    st.error(f"⚠️ {err}")
 
-                # ハイライト済みファイル
-                if all_outputs:
-                    st.markdown("**📄 ハイライト済みファイル**")
-                    if len(all_outputs) == 1:
-                        out = all_outputs[0]
-                        st.download_button(
-                            label=f"📥 {out['name']} をダウンロード",
-                            data=out['bytes'],
-                            file_name=out['name'],
-                            mime=out['mime']
-                        )
-                    else:
-                        zip_buf = io.BytesIO()
-                        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                            for out in all_outputs:
-                                zf.writestr(out['name'], out['bytes'])
-                        zip_buf.seek(0)
-                        st.download_button(
-                            label=f"📦 {len(all_outputs)} 件をZIPでまとめてダウンロード",
-                            data=zip_buf.getvalue(),
-                            file_name="ハイライト済み_一括.zip",
-                            mime="application/zip"
-                        )
-                        with st.expander("📄 個別にダウンロードする"):
-                            for out in all_outputs:
-                                col1, col2 = st.columns([3, 1])
-                                with col1:
-                                    st.caption(out['name'])
-                                with col2:
-                                    st.download_button(
-                                        label="DL",
-                                        data=out['bytes'],
-                                        file_name=out['name'],
-                                        mime=out['mime'],
-                                        key=out['name']
-                                    )
+                if all_outputs or weekly_excel_bytes:
+                    total_files = len(uploaded_files) - len(errors)
+                    st.markdown(f"""
+                    <div class="result-box">
+                        <h3 style="color:#00c896; margin:0 0 8px">✓ {total_files} 件の処理が完了しました！</h3>
+                        <p style="color:#6b8aad; margin:0">合計 {sum(o['cells'] for o in all_outputs)} セルをハイライト</p>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-                # 週間天気予報ファイル
-                if weekly_excel_bytes or weekly_pdf_bytes:
-                    st.markdown("**📊 週間天気予報**")
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        if weekly_pdf_bytes:
+                    if all_outputs:
+                        st.markdown("**📄 ハイライト済みファイル**")
+                        if len(all_outputs) == 1:
+                            out = all_outputs[0]
                             st.download_button(
-                                label="📥 PDF でダウンロード",
-                                data=weekly_pdf_bytes,
-                                file_name="週間天気予報_完成.pdf",
-                                mime="application/pdf",
-                                key="weekly_pdf"
+                                label=f"📥 {out['name']} をダウンロード",
+                                data=out['bytes'],
+                                file_name=out['name'],
+                                mime=out['mime']
                             )
                         else:
-                            st.warning("PDF変換に失敗しました。Excelファイルをご利用ください。")
-
-                    with col2:
-                        if weekly_excel_bytes:
+                            zip_buf = io.BytesIO()
+                            with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                                for out in all_outputs:
+                                    zf.writestr(out['name'], out['bytes'])
+                            zip_buf.seek(0)
                             st.download_button(
-                                label="📥 Excel でダウンロード",
-                                data=weekly_excel_bytes,
-                                file_name="週間天気予報_完成.xlsm",
-                                mime="application/vnd.ms-excel.sheet.macroEnabled.12",
-                                key="weekly_excel"
+                                label=f"📦 {len(all_outputs)} 件をZIPでまとめてダウンロード",
+                                data=zip_buf.getvalue(),
+                                file_name="ハイライト済み_一括.zip",
+                                mime="application/zip"
                             )
+                            with st.expander("📄 個別にダウンロードする"):
+                                for out in all_outputs:
+                                    col1, col2 = st.columns([3, 1])
+                                    with col1:
+                                        st.caption(out['name'])
+                                    with col2:
+                                        st.download_button(
+                                            label="DL",
+                                            data=out['bytes'],
+                                            file_name=out['name'],
+                                            mime=out['mime'],
+                                            key=out['name']
+                                        )
+
+                    if weekly_excel_bytes or weekly_pdf_bytes:
+                        st.markdown("**📊 週間天気予報**")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if weekly_pdf_bytes:
+                                st.download_button(
+                                    label="📥 PDF でダウンロード",
+                                    data=weekly_pdf_bytes,
+                                    file_name="週間天気予報_完成.pdf",
+                                    mime="application/pdf",
+                                    key="weekly_pdf"
+                                )
+                            else:
+                                st.warning("PDF変換に失敗しました。Excelファイルをご利用ください。")
+                        with col2:
+                            if weekly_excel_bytes:
+                                st.download_button(
+                                    label="📥 Excel でダウンロード",
+                                    data=weekly_excel_bytes,
+                                    file_name="週間天気予報_完成.xlsm",
+                                    mime="application/vnd.ms-excel.sheet.macroEnabled.12",
+                                    key="weekly_excel"
+                                )
 
 st.divider()
-st.caption("📌 使い方：モード選択 → PDFをアップロード → 実行 → ダウンロード")
+st.caption("📌 使い方：モード選択 → PDFをアップロード → 実行 → ダウンロード
