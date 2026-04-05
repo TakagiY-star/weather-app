@@ -1,11 +1,12 @@
 """
 気象レポートPDF 降水量ハイライター
-複数PDF同時アップロード対応版
+複数PDF同時アップロード対応・PDF/JPG出力選択対応版
 """
 
 import streamlit as st
 import tempfile
 import os
+import io
 import zipfile
 from itertools import groupby
 
@@ -46,9 +47,6 @@ st.markdown("""
         border-radius: 8px;
         padding: 10px 14px;
         margin: 6px 0;
-        display: flex;
-        align-items: center;
-        gap: 10px;
         font-size: 13px;
     }
 </style>
@@ -154,10 +152,29 @@ def draw_highlights(input_path, output_path, page_groups):
     doc.save(output_path)
 
 
-def process_single_pdf(uploaded_file, tmpdir):
-    """1つのPDFを処理して出力バイト列と統計を返す"""
+def pdf_to_jpg_bytes(pdf_path, dpi=150):
+    """PDFの各ページをJPG画像に変換してバイト列のリストで返す"""
+    doc = pdfium.PdfDocument(pdf_path)
+    scale = dpi / 72
+    results = []
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        bitmap = page.render(scale=scale, rotation=0)
+        pil_image = bitmap.to_pil()
+
+        buf = io.BytesIO()
+        pil_image.save(buf, format="JPEG", quality=90)
+        results.append((page_num, buf.getvalue()))
+
+    return results
+
+
+def process_single_pdf(uploaded_file, tmpdir, output_format, dpi=150):
+    """1つのPDFを処理して出力データのリストを返す"""
     input_path = os.path.join(tmpdir, "input.pdf")
-    output_path = os.path.join(tmpdir, uploaded_file.name)
+    highlighted_path = os.path.join(tmpdir, "highlighted.pdf")
+    base_name = os.path.splitext(uploaded_file.name)[0]
 
     with open(input_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
@@ -169,18 +186,41 @@ def process_single_pdf(uploaded_file, tmpdir):
     if total_cells == 0:
         return None, 0, 0
 
-    draw_highlights(input_path, output_path, page_groups)
+    draw_highlights(input_path, highlighted_path, page_groups)
 
-    with open(output_path, "rb") as f:
-        output_bytes = f.read()
+    outputs = []
 
-    return output_bytes, total_cells, total_groups
+    if output_format == "PDF":
+        with open(highlighted_path, "rb") as f:
+            outputs.append({
+                "name": f"{base_name}_ハイライト済.pdf",
+                "bytes": f.read(),
+                "mime": "application/pdf"
+            })
+    else:  # JPG
+        pages = pdf_to_jpg_bytes(highlighted_path, dpi=dpi)
+        if len(pages) == 1:
+            _, jpg_bytes = pages[0]
+            outputs.append({
+                "name": f"{base_name}_ハイライト済.jpg",
+                "bytes": jpg_bytes,
+                "mime": "image/jpeg"
+            })
+        else:
+            for page_num, jpg_bytes in pages:
+                outputs.append({
+                    "name": f"{base_name}_ハイライト済_p{page_num + 1}.jpg",
+                    "bytes": jpg_bytes,
+                    "mime": "image/jpeg"
+                })
+
+    return outputs, total_cells, total_groups
 
 
 # ---------- 画面 ----------
 
 st.title("🌧️ 降水量ハイライター")
-st.caption("気象レポートのPDFをアップロードすると、降水量が0より大きいセルを水色の枠と薄い水色でハイライトします。複数ファイルの同時処理に対応しています。")
+st.caption("気象レポートのPDFをアップロードすると、降水量が0より大きいセルを水色の枠と薄い水色でハイライトします。")
 
 st.divider()
 
@@ -192,19 +232,39 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    # アップロード済みファイル一覧
     st.markdown(f"**{len(uploaded_files)} 件のファイルが選択されています**")
     for f in uploaded_files:
         st.markdown(f"""
         <div class="file-row">
-            📄 {f.name} <span style="color:#6b8aad; margin-left:auto">{f.size / 1024:.0f} KB</span>
+            📄 {f.name}&nbsp;&nbsp;<span style="color:#6b8aad">{f.size / 1024:.0f} KB</span>
         </div>
         """, unsafe_allow_html=True)
 
     st.markdown("")
 
-    if st.button("⚡ まとめてハイライト処理を実行"):
-        results = []
+    # 出力形式の選択
+    st.markdown("**出力形式を選択してください**")
+    output_format = st.radio(
+        label="出力形式",
+        options=["PDF", "JPG"],
+        horizontal=True,
+        label_visibility="collapsed"
+    )
+
+    if output_format == "JPG":
+        dpi = st.select_slider(
+            "画質（DPI）",
+            options=[72, 96, 150, 200, 300],
+            value=150,
+            help="数値が大きいほど高画質・ファイルサイズ大。通常は150で十分です"
+        )
+    else:
+        dpi = 150
+
+    st.markdown("")
+
+    if st.button("⚡ ハイライト処理を実行"):
+        all_outputs = []
         errors = []
 
         progress_bar = st.progress(0, text="処理中...")
@@ -212,85 +272,80 @@ if uploaded_files:
         with tempfile.TemporaryDirectory() as tmpdir:
             for i, uploaded_file in enumerate(uploaded_files):
                 progress_bar.progress(
-                    (i) / len(uploaded_files),
+                    i / len(uploaded_files),
                     text=f"処理中 ({i+1}/{len(uploaded_files)}): {uploaded_file.name}"
                 )
-
                 try:
-                    output_bytes, total_cells, total_groups = process_single_pdf(
-                        uploaded_file, tmpdir
+                    outputs, total_cells, total_groups = process_single_pdf(
+                        uploaded_file, tmpdir, output_format, dpi
                     )
-                    if output_bytes is None:
+                    if outputs is None:
                         errors.append(f"{uploaded_file.name}：降水量データが見つかりませんでした")
                     else:
-                        out_name = uploaded_file.name.replace(".pdf", "_ハイライト済.pdf")
-                        results.append({
-                            'name': uploaded_file.name,
-                            'out_name': out_name,
-                            'bytes': output_bytes,
-                            'cells': total_cells,
-                            'groups': total_groups
-                        })
+                        for out in outputs:
+                            all_outputs.append({
+                                **out,
+                                "cells": total_cells,
+                                "groups": total_groups,
+                                "source": uploaded_file.name
+                            })
                 except Exception as e:
                     errors.append(f"{uploaded_file.name}：エラー ({e})")
 
             progress_bar.progress(1.0, text="完了！")
 
-            # エラー表示
             for err in errors:
                 st.error(f"⚠️ {err}")
 
-            if results:
-                total_files = len(results)
-
+            if all_outputs:
+                total_files = len(uploaded_files) - len(errors)
                 st.markdown(f"""
                 <div class="result-box">
                     <h3 style="color:#00c896; margin:0 0 8px">✓ {total_files} 件の処理が完了しました！</h3>
-                    <p style="color:#6b8aad; margin:0">合計 {sum(r['cells'] for r in results)} セルをハイライト</p>
                 </div>
                 """, unsafe_allow_html=True)
 
-                # ファイルが1つの場合：そのままダウンロード
-                if total_files == 1:
-                    r = results[0]
+                # 1ファイル・1ページ → 直接ダウンロード
+                if len(all_outputs) == 1:
+                    out = all_outputs[0]
+                    ext = "PDF" if output_format == "PDF" else "JPG"
                     st.download_button(
-                        label=f"📥 {r['out_name']} をダウンロード",
-                        data=r['bytes'],
-                        file_name=r['out_name'],
-                        mime="application/pdf"
+                        label=f"📥 {out['name']} をダウンロード（{ext}）",
+                        data=out['bytes'],
+                        file_name=out['name'],
+                        mime=out['mime']
                     )
 
-                # 複数ファイルの場合：ZIP でまとめてダウンロード
+                # 複数ファイル or 複数ページJPG → ZIPでまとめてダウンロード
                 else:
-                    zip_path = os.path.join(tmpdir, "ハイライト済み_一括.zip")
-                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                        for r in results:
-                            zf.writestr(r['out_name'], r['bytes'])
+                    zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        for out in all_outputs:
+                            zf.writestr(out['name'], out['bytes'])
+                    zip_buf.seek(0)
 
-                    with open(zip_path, "rb") as f:
-                        zip_bytes = f.read()
-
+                    ext_label = "PDF" if output_format == "PDF" else "JPG"
                     st.download_button(
-                        label=f"📦 {total_files} 件をZIPでまとめてダウンロード",
-                        data=zip_bytes,
+                        label=f"📦 {len(all_outputs)} 件をZIPでまとめてダウンロード（{ext_label}）",
+                        data=zip_buf.getvalue(),
                         file_name="ハイライト済み_一括.zip",
                         mime="application/zip"
                     )
 
-                    # 個別ダウンロードも表示
+                    # 個別ダウンロード
                     with st.expander("📄 個別にダウンロードする"):
-                        for r in results:
+                        for out in all_outputs:
                             col1, col2 = st.columns([3, 1])
                             with col1:
-                                st.caption(f"{r['out_name']}（{r['cells']}セル / {r['groups']}グループ）")
+                                st.caption(f"{out['name']}")
                             with col2:
                                 st.download_button(
                                     label="DL",
-                                    data=r['bytes'],
-                                    file_name=r['out_name'],
-                                    mime="application/pdf",
-                                    key=r['name']
+                                    data=out['bytes'],
+                                    file_name=out['name'],
+                                    mime=out['mime'],
+                                    key=out['name']
                                 )
 
 st.divider()
-st.caption("📌 使い方：PDFを選択（複数可）→ 実行ボタン → ダウンロード")
+st.caption("📌 使い方：PDFを選択（複数可）→ 出力形式を選択 → 実行 → ダウンロード")
