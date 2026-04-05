@@ -145,6 +145,42 @@ def draw_highlights(input_path, output_path, page_groups):
     doc.save(output_path)
 
 
+def find_forecast_crop_top(pdf_path):
+    """
+    pdfplumberで「現在から24時」または「日付」テキストの位置を検出し、
+    1時間予報エリアのクロップ開始位置(pt)を返す
+    """
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[0]
+        words = page.extract_words()
+        candidates = []
+        for w in words:
+            if '現在から' in w['text'] or w['text'] == '日付':
+                candidates.append(w['top'])
+        if candidates:
+            return min(candidates) - 3
+    return 210
+
+
+def find_forecast_crop_bottom(pdf_path):
+    """
+    4日目の最終行（風のm/s行）下端をpdfplumberで検出し、
+    クロップ終了位置(pt)を返す
+    """
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[0]
+        words = page.extract_words()
+        ms_tops = [w['top'] for w in words if w['text'] == 'm/s']
+        if ms_tops:
+            last_ms_top = max(ms_tops)
+            last_ms_bottom = max(
+                w['bottom'] for w in words
+                if w['text'] == 'm/s' and w['top'] == last_ms_top
+            )
+            return last_ms_bottom + 5
+    return 780
+
+
 def trim_whitespace(img, margin=5):
     """白い余白を自動トリミング"""
     bg = Image.new("RGB", img.size, (255, 255, 255))
@@ -163,25 +199,25 @@ def trim_whitespace(img, margin=5):
 def crop_forecast_jpg(pdf_path, dpi=300):
     """
     ハイライト済みPDFから1〜4日目の1時間予報エリアを
-    トリミングしてJPG画像バイト列を返す
+    動的に検出してトリミングし、JPG画像バイト列を返す
     """
+    crop_top_pt = find_forecast_crop_top(pdf_path)
+    crop_bottom_pt = find_forecast_crop_bottom(pdf_path)
+
     doc = pdfium.PdfDocument(pdf_path)
     page = doc[0]
     scale = dpi / 72
 
-    # ページ全体をレンダリング
     bitmap = page.render(scale=scale)
     img = bitmap.to_pil()
 
-    # 1〜4日目エリアをpdfplumber座標で切り取り
-    px_top = int(212 * scale)
-    px_bottom = int(780 * scale)
+    px_top = int(crop_top_pt * scale)
+    px_bottom = int(crop_bottom_pt * scale)
+    px_bottom = min(px_bottom, img.height)
+
     cropped = img.crop((0, px_top, img.width, px_bottom))
+    trimmed = trim_whitespace(cropped, margin=5)
 
-    # 白い余白をトリミング
-    trimmed = trim_whitespace(cropped, margin=10)
-
-    # JPGとして返す
     buf = io.BytesIO()
     trimmed.save(buf, format="JPEG", quality=95)
     return buf.getvalue()
@@ -196,7 +232,6 @@ def process_pdf(uploaded_file, tmpdir, dpi):
     with open(input_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    # 降水量グループ抽出
     page_groups = extract_rainfall_groups(input_path)
     total_cells = sum(len(g) for pg in page_groups for g in pg['groups'])
     total_groups = sum(len(pg['groups']) for pg in page_groups)
@@ -204,14 +239,11 @@ def process_pdf(uploaded_file, tmpdir, dpi):
     if total_cells == 0:
         return None, None, 0, 0
 
-    # ハイライト処理
     draw_highlights(input_path, highlighted_path, page_groups)
 
-    # ハイライト済みPDFのバイト列
     with open(highlighted_path, "rb") as f:
         highlighted_bytes = f.read()
 
-    # 1時間予報JPG
     jpg_bytes = crop_forecast_jpg(highlighted_path, dpi=dpi)
 
     return highlighted_bytes, jpg_bytes, total_cells, total_groups
@@ -295,7 +327,6 @@ if uploaded_files:
             </div>
             """, unsafe_allow_html=True)
 
-            # 1ファイルの場合：個別ダウンロード
             if len(results) == 1:
                 r = results[0]
                 col1, col2 = st.columns(2)
@@ -313,8 +344,6 @@ if uploaded_files:
                         file_name=f"{r['base_name']}_1時間予報.jpg",
                         mime="image/jpeg"
                     )
-
-            # 複数ファイルの場合：ZIPでまとめてダウンロード
             else:
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
