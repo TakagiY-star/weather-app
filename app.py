@@ -1,6 +1,6 @@
 """
 気象レポートPDF 降水量ハイライター
-複数PDF・PDF/JPG出力・週間天気予報PDF生成・PDF合体対応版
+複数PDF・PDF/JPG出力・週間天気予報PDF生成・1ページ合体対応版
 """
 
 import streamlit as st
@@ -253,15 +253,53 @@ def excel_to_pdf(xlsm_path, tmpdir):
         return None
 
 
-def merge_pdfs(pdf_bytes_list):
-    """複数のPDFバイト列を順番に結合して返す"""
-    writer = PdfWriter()
-    for pdf_bytes in pdf_bytes_list:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        for page in reader.pages:
-            writer.add_page(page)
+def combine_as_one_page(weekly_pdf_bytes, report_pdf_bytes, dpi=150):
+    """
+    週間天気予報PDFの下に1時間予報の切り抜きを貼り付けて
+    1ページのPDFを生成して返す
+    """
+    scale = dpi / 72
+
+    # 週間天気予報PDFをレンダリング（1ページ目）
+    weekly_doc = pdfium.PdfDocument(io.BytesIO(weekly_pdf_bytes))
+    weekly_page = weekly_doc[0]
+    weekly_img = weekly_page.render(scale=scale).to_pil()
+
+    # 気象レポートPDFにハイライト処理して1時間予報を切り抜き
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "report.pdf")
+        highlighted_path = os.path.join(tmpdir, "highlighted.pdf")
+
+        with open(input_path, "wb") as f:
+            f.write(report_pdf_bytes)
+
+        page_groups = extract_rainfall_groups(input_path)
+        if page_groups:
+            draw_highlights(input_path, highlighted_path, page_groups)
+        else:
+            highlighted_path = input_path
+
+        crop_img = crop_forecast_image(highlighted_path, dpi=dpi)
+
+    # 切り抜き画像を週間天気予報の幅に合わせてリサイズ
+    target_w = weekly_img.width
+    ratio = target_w / crop_img.width
+    crop_resized = crop_img.resize(
+        (target_w, int(crop_img.height * ratio)), Image.LANCZOS
+    )
+
+    # 縦に結合（週間天気予報の下に1時間予報を配置）
+    combined = Image.new(
+        "RGB",
+        (target_w, weekly_img.height + crop_resized.height),
+        (255, 255, 255)
+    )
+    combined.paste(weekly_img, (0, 0))
+    combined.paste(crop_resized, (0, weekly_img.height))
+
+    # 1ページのPDFとして保存
     buf = io.BytesIO()
-    writer.write(buf)
+    combined.save(buf, format="PDF", resolution=dpi)
     return buf.getvalue()
 
 
@@ -323,7 +361,7 @@ st.divider()
 st.markdown('<div class="section-title">処理モードを選択</div>', unsafe_allow_html=True)
 mode = st.radio(
     label="モード",
-    options=["📄 ハイライトのみ", "📊 週間天気予報PDFも作成", "📎 PDFを合体させる"],
+    options=["📄 ハイライトのみ", "📊 週間天気予報PDFも作成", "📎 1ページに合体させる"],
     label_visibility="collapsed",
     horizontal=True
 )
@@ -331,9 +369,9 @@ mode = st.radio(
 st.divider()
 
 # ============================================================
-# モード：PDFを合体させる
+# モード：1ページに合体させる
 # ============================================================
-if mode == "📎 PDFを合体させる":
+if mode == "📎 1ページに合体させる":
     st.markdown('<div class="section-title">① 週間天気予報PDF（出力シートをPDF化したもの）</div>', unsafe_allow_html=True)
     weekly_pdf_file = st.file_uploader(
         "週間天気予報のPDFを選択",
@@ -341,7 +379,8 @@ if mode == "📎 PDFを合体させる":
         key="weekly_pdf_upload"
     )
 
-    st.markdown('<div class="section-title">② 気象レポートPDF（ハイライト済みでも未処理でも可）</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">② 気象レポートPDF</div>', unsafe_allow_html=True)
+    st.caption("ハイライト処理と1時間予報の切り抜きを自動で行います")
     report_pdf_file = st.file_uploader(
         "気象レポートのPDFを選択",
         type=["pdf"],
@@ -353,35 +392,30 @@ if mode == "📎 PDFを合体させる":
     if weekly_pdf_file and report_pdf_file:
         st.success(f"✅ {weekly_pdf_file.name}  ＋  {report_pdf_file.name}")
 
-        st.markdown("**合体の順番を選択してください**")
-        order = st.radio(
-            label="順番",
-            options=["週間天気予報 → 気象レポート", "気象レポート → 週間天気予報"],
-            horizontal=True,
-            label_visibility="collapsed"
-        )
+        if st.button("📎 1ページに合体してダウンロード"):
+            with st.spinner("処理中... ハイライト処理と合体を行っています"):
+                try:
+                    result_bytes = combine_as_one_page(
+                        weekly_pdf_file.getbuffer(),
+                        report_pdf_file.getbuffer(),
+                        dpi=150
+                    )
 
-        if st.button("📎 PDFを合体してダウンロード"):
-            with st.spinner("合体中..."):
-                if order == "週間天気予報 → 気象レポート":
-                    pdf_list = [weekly_pdf_file.getbuffer(), report_pdf_file.getbuffer()]
-                else:
-                    pdf_list = [report_pdf_file.getbuffer(), weekly_pdf_file.getbuffer()]
+                    st.markdown("""
+                    <div class="result-box">
+                        <h3 style="color:#00c896; margin:0 0 8px">✓ 合体完了！</h3>
+                        <p style="color:#6b8aad; margin:0">週間天気予報の下に1時間予報を配置した1ページPDFが完成しました</p>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-                merged_bytes = merge_pdfs(pdf_list)
-
-            st.markdown("""
-            <div class="result-box">
-                <h3 style="color:#00c896; margin:0 0 8px">✓ 合体完了！</h3>
-            </div>
-            """, unsafe_allow_html=True)
-
-            st.download_button(
-                label="📥 合体済みPDFをダウンロード",
-                data=merged_bytes,
-                file_name="週間天気予報_完成.pdf",
-                mime="application/pdf"
-            )
+                    st.download_button(
+                        label="📥 完成PDFをダウンロード",
+                        data=result_bytes,
+                        file_name="週間天気予報_完成.pdf",
+                        mime="application/pdf"
+                    )
+                except Exception as e:
+                    st.error(f"エラーが発生しました: {e}")
 
 # ============================================================
 # モード：ハイライトのみ / 週間天気予報PDFも作成
@@ -556,4 +590,4 @@ else:
                                 )
 
 st.divider()
-st.caption("使い方：モード選択 -> PDFをアップロード -> 実行 -> ダウンロード")
+st.caption("使い方：モード選択 -> PDFをアップロード -> 実行 -> ダ
