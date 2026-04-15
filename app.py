@@ -228,10 +228,12 @@ def process_pdf(uploaded_file, tmpdir, dpi):
     total_cells = sum(len(g) for pg in page_groups for g in pg['groups'])
     total_groups = sum(len(pg['groups']) for pg in page_groups)
 
-    if total_cells == 0:
-        return None, None, 0, 0
-
-    draw_highlights(input_path, highlighted_path, page_groups)
+    # 降水量ゼロでもハイライトなしで処理を続ける
+    if total_cells > 0:
+        draw_highlights(input_path, highlighted_path, page_groups)
+    else:
+        import shutil
+        shutil.copy(input_path, highlighted_path)
 
     with open(highlighted_path, "rb") as f:
         highlighted_bytes = f.read()
@@ -291,7 +293,7 @@ if uploaded_files:
                         uploaded_file, tmpdir, dpi
                     )
                     if highlighted_bytes is None:
-                        errors.append(f"{uploaded_file.name}：降水量データが見つかりませんでした")
+                        errors.append(f"{uploaded_file.name}：処理中にエラーが発生しました")
                     else:
                         base_name = os.path.splitext(uploaded_file.name)[0]
                         results.append({
