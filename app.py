@@ -323,6 +323,10 @@ if uploaded_files:
 
             if len(results) == 1:
                 r = results[0]
+
+                if r["cells"] == 0:
+                    st.info("気象レポートによると72時間以内の雨予報は確認できませんでした")
+
                 col1, col2 = st.columns(2)
                 with col1:
                     st.download_button(
@@ -339,6 +343,11 @@ if uploaded_files:
                         mime="image/png"
                     )
             else:
+                zero_files = [r["source"] for r in results if r["cells"] == 0]
+                if zero_files:
+                    for fname in zero_files:
+                        st.info(f"{fname}：気象レポートによると72時間以内の雨予報は確認できませんでした")
+
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for r in results:
