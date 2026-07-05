@@ -5,6 +5,7 @@
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import tempfile
 import os
 import io
@@ -72,7 +73,12 @@ def extract_rainfall_groups(pdf_path):
             tables = page.find_tables(tset)
             if not tables:
                 continue
-            all_cells = tables[0].cells
+            # 全テーブルのセルを統合し、異常に大きいセル（外枠の誤検出）を除外
+            all_cells = [
+                c for t in tables
+                for c in t.cells
+                if (c[2] - c[0]) < 200 and (c[3] - c[1]) < 100
+            ]
             rainfall_boxes = []
             for w in words:
                 in_row = any(abs(w['top'] - mt) <= 8 for mt in mmh_tops)
@@ -314,6 +320,10 @@ if uploaded_files:
 
         if results:
             total = len(results)
+
+            # 自動スクロール用のアンカー
+            st.markdown('<div id="result-anchor"></div>', unsafe_allow_html=True)
+
             st.markdown(f"""
             <div class="result-box">
                 <h3 style="color:#00c896; margin:0 0 8px">✓ {total} 件の処理が完了しました！</h3>
@@ -321,9 +331,22 @@ if uploaded_files:
             </div>
             """, unsafe_allow_html=True)
 
+            # 結果エリアへ自動スクロール
+            components.html("""
+            <script>
+                setTimeout(function() {
+                    const anchor = window.parent.document.getElementById('result-anchor');
+                    if (anchor) {
+                        anchor.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
+                }, 300);
+            </script>
+            """, height=0)
+
             if len(results) == 1:
                 r = results[0]
 
+                # 降水量ゼロの場合はメッセージ表示
                 if r["cells"] == 0:
                     st.info("気象レポートによると72時間以内の雨予報は確認できませんでした")
 
@@ -343,17 +366,18 @@ if uploaded_files:
                         mime="image/png"
                     )
             else:
-                zero_files = [r["source"] for r in results if r["cells"] == 0]
-                if zero_files:
-                    for fname in zero_files:
-                        st.info(f"{fname}：気象レポートによると72時間以内の雨予報は確認できませんでした")
-
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for r in results:
                         zf.writestr(f"{r['base_name']}_ハイライト済.pdf", r["highlighted_bytes"])
                         zf.writestr(f"{r['base_name']}_1時間予報.png", r["png_bytes"])
                 zip_buf.seek(0)
+
+                # 降水量ゼロのファイルがある場合はメッセージ表示
+                zero_files = [r["source"] for r in results if r["cells"] == 0]
+                if zero_files:
+                    for fname in zero_files:
+                        st.info(f"{fname}：気象レポートによると72時間以内の雨予報は確認できませんでした")
 
                 st.download_button(
                     label=f"📦 {total} 件をZIPでまとめてダウンロード",
