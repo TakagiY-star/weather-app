@@ -282,6 +282,36 @@ def clear_files():
     st.session_state.uploader_key += 1
 
 
+def scroll_to_top():
+    """ページ最上部へスムーズにスクロール（ダウンロード後に使用）"""
+    components.html(
+        """
+        <script>
+            setTimeout(function() {
+                const doc = window.parent.document;
+                // Streamlitのバージョン差を吸収するため複数の候補を順に試す
+                const selectors = [
+                    'section.main',
+                    '.main',
+                    'section[tabindex]',
+                    '.stMainBlockContainer',
+                    '[data-testid="stAppViewContainer"] section',
+                    '[data-testid="stMain"]'
+                ];
+                for (const sel of selectors) {
+                    const el = doc.querySelector(sel);
+                    if (el) {
+                        el.scrollTo({top: 0, behavior: 'smooth'});
+                    }
+                }
+                window.parent.scrollTo({top: 0, behavior: 'smooth'});
+            }, 150);
+        </script>
+        """,
+        height=0
+    )
+
+
 uploaded_files = st.file_uploader(
     "気象レポートのPDFを選択してください（複数選択可）",
     type=["pdf"],
@@ -290,28 +320,25 @@ uploaded_files = st.file_uploader(
     key=f"uploader_{st.session_state.uploader_key}"
 )
 
-# アップロード欄の直下に大きなクリアボタン
+# アップロード欄の直下にボタンを集約（マウス移動を最小化）
 if uploaded_files:
-    st.button("🗑️ クリア（アップロードした気象レポートを消す）", on_click=clear_files, key="clear_main")
+    # 実行ボタンとクリアボタンを横並びで、アップロード欄のすぐ下に配置
+    run_col, clear_col = st.columns([2, 1])
+    with run_col:
+        run_clicked = st.button("⚡ ハイライト＆切り抜きを実行")
+    with clear_col:
+        st.button("🗑️ クリア", on_click=clear_files, key="clear_main")
 
-    st.markdown(f"**{len(uploaded_files)} 件のファイルが選択されています**")
-    for f in uploaded_files:
-        st.markdown(f"""
-        <div class="file-row">
-            📄 {f.name}&nbsp;&nbsp;<span style="color:#6b8aad">{f.size / 1024:.0f} KB</span>
-        </div>
-        """, unsafe_allow_html=True)
+    # 画質設定は普段触らないので折りたたみに収納（デフォルト300）
+    with st.expander("画質設定（DPI）"):
+        dpi = st.select_slider(
+            "画質（DPI）",
+            options=[150, 200, 300, 400, 600],
+            value=300,
+            help="数値が大きいほど高画質・ファイルサイズ大。通常は300で十分です"
+        )
 
-    st.markdown("")
-
-    dpi = st.select_slider(
-        "画質（DPI）",
-        options=[150, 200, 300, 400, 600],
-        value=300,
-        help="数値が大きいほど高画質・ファイルサイズ大。通常は300で十分です"
-    )
-
-    if st.button("⚡ ハイライト＆切り抜きを実行"):
+    if run_clicked:
         results = []
         errors = []
         progress_bar = st.progress(0, text="処理中...")
@@ -380,19 +407,22 @@ if uploaded_files:
 
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.download_button(
+                    dl_pdf = st.download_button(
                         label="📥 ハイライト済PDF",
                         data=r["highlighted_bytes"],
                         file_name=f"{r['base_name']}_ハイライト済.pdf",
                         mime="application/pdf"
                     )
                 with col2:
-                    st.download_button(
+                    dl_png = st.download_button(
                         label="📥 1時間予報PNG",
                         data=r["png_bytes"],
                         file_name=f"{r['base_name']}_1時間予報.png",
                         mime="image/png"
                     )
+                # ダウンロードしたら一番上へ自動スクロール
+                if dl_pdf or dl_png:
+                    scroll_to_top()
             else:
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -407,12 +437,14 @@ if uploaded_files:
                     for fname in zero_files:
                         st.info(f"{fname}：気象レポートによると72時間以内の雨予報は確認できませんでした")
 
-                st.download_button(
+                dl_zip = st.download_button(
                     label=f"📦 {total} 件をZIPでまとめてダウンロード",
                     data=zip_buf.getvalue(),
                     file_name="気象レポート_処理済み.zip",
                     mime="application/zip"
                 )
+                if dl_zip:
+                    scroll_to_top()
 
                 with st.expander("📄 個別にダウンロードする"):
                     for r in results:
