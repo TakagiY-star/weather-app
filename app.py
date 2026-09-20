@@ -63,7 +63,8 @@ st.markdown("""
         height: 22px;
     }
     /* クリアボタン（赤系）を目立たせる */
-    .clear-btn button {
+    .st-key-clear_top button,
+    .st-key-clear_bottom button {
         background: linear-gradient(135deg, #ff6b6b, #e63946) !important;
     }
 </style>
@@ -312,9 +313,7 @@ if uploaded_files:
     with run_col:
         run_clicked = st.button("⚡ ハイライト＆切り抜きを実行")
     with clear_col:
-        st.markdown('<div class="clear-btn">', unsafe_allow_html=True)
         st.button("🗑️ クリア", on_click=clear_files, key="clear_top")
-        st.markdown('</div>', unsafe_allow_html=True)
 
     if run_clicked:
         results = []
@@ -442,13 +441,11 @@ if uploaded_files:
 
             # ダウンロード後、次の予報へ進むための大きなクリアボタン
             st.markdown("")
-            st.markdown('<div class="clear-btn">', unsafe_allow_html=True)
             st.button(
                 "🗑️ クリアして次の予報へ",
                 on_click=clear_files,
                 key="clear_bottom"
             )
-            st.markdown('</div>', unsafe_allow_html=True)
 
 st.divider()
 st.caption("使い方：PDFをアップロード -> 実行 -> ダウンロード -> クリアして次の予報へ")
