@@ -277,10 +277,18 @@ st.divider()
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
+# 処理結果の保存領域（ダウンロードしても消えないように保持）
+if "results" not in st.session_state:
+    st.session_state.results = None
+if "errors" not in st.session_state:
+    st.session_state.errors = []
+
 
 def clear_files():
-    """アップロード済みファイルを一括クリア（次の予報へ）"""
+    """アップロード済みファイルと処理結果を一括クリア（次の予報へ）"""
     st.session_state.uploader_key += 1
+    st.session_state.results = None
+    st.session_state.errors = []
 
 
 uploaded_files = st.file_uploader(
@@ -347,105 +355,113 @@ if uploaded_files:
 
             progress_bar.progress(1.0, text="完了！")
 
-        for err in errors:
-            st.error(f"⚠️ {err}")
+        # 処理結果をsession_stateに保存（ダウンロードで再実行されても保持される）
+        st.session_state.results = results
+        st.session_state.errors = errors
 
-        if results:
-            total = len(results)
+    # session_stateに結果があれば表示（ダウンロード後も画面を維持）
+    errors = st.session_state.errors
+    results = st.session_state.results
 
-            # 自動スクロール用のアンカー
-            st.markdown('<div id="result-anchor"></div>', unsafe_allow_html=True)
+    for err in errors:
+        st.error(f"⚠️ {err}")
 
-            st.markdown(f"""
-            <div class="result-box">
-                <h3 style="color:#00c896; margin:0 0 8px">✓ {total} 件の処理が完了しました！</h3>
-                <p style="color:#6b8aad; margin:0">合計 {sum(r['cells'] for r in results)} セルをハイライト</p>
-            </div>
-            """, unsafe_allow_html=True)
+    if results:
+        total = len(results)
 
-            # 結果エリアへ自動スクロール
-            components.html("""
-            <script>
-                setTimeout(function() {
-                    const anchor = window.parent.document.getElementById('result-anchor');
-                    if (anchor) {
-                        anchor.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                    }
-                }, 300);
-            </script>
-            """, height=0)
+        # 自動スクロール用のアンカー
+        st.markdown('<div id="result-anchor"></div>', unsafe_allow_html=True)
 
-            if len(results) == 1:
-                r = results[0]
+        st.markdown(f"""
+        <div class="result-box">
+            <h3 style="color:#00c896; margin:0 0 8px">✓ {total} 件の処理が完了しました！</h3>
+            <p style="color:#6b8aad; margin:0">合計 {sum(r['cells'] for r in results)} セルをハイライト</p>
+        </div>
+        """, unsafe_allow_html=True)
 
-                # 降水量ゼロの場合はメッセージ表示
-                if r["cells"] == 0:
-                    st.info("気象レポートによると72時間以内の雨予報は確認できませんでした")
+        # 結果エリアへ自動スクロール
+        components.html("""
+        <script>
+            setTimeout(function() {
+                const anchor = window.parent.document.getElementById('result-anchor');
+                if (anchor) {
+                    anchor.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            }, 300);
+        </script>
+        """, height=0)
 
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.download_button(
-                        label="📥 ハイライト済PDF",
-                        data=r["highlighted_bytes"],
-                        file_name=f"{r['base_name']}_ハイライト済.pdf",
-                        mime="application/pdf"
-                    )
-                with col2:
-                    st.download_button(
-                        label="📥 1時間予報PNG",
-                        data=r["png_bytes"],
-                        file_name=f"{r['base_name']}_1時間予報.png",
-                        mime="image/png"
-                    )
-            else:
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    for r in results:
-                        zf.writestr(f"{r['base_name']}_ハイライト済.pdf", r["highlighted_bytes"])
-                        zf.writestr(f"{r['base_name']}_1時間予報.png", r["png_bytes"])
-                zip_buf.seek(0)
+        if len(results) == 1:
+            r = results[0]
 
-                # 降水量ゼロのファイルがある場合はメッセージ表示
-                zero_files = [r["source"] for r in results if r["cells"] == 0]
-                if zero_files:
-                    for fname in zero_files:
-                        st.info(f"{fname}：気象レポートによると72時間以内の雨予報は確認できませんでした")
+            # 降水量ゼロの場合はメッセージ表示
+            if r["cells"] == 0:
+                st.info("気象レポートによると72時間以内の雨予報は確認できませんでした")
 
+            col1, col2 = st.columns(2)
+            with col1:
                 st.download_button(
-                    label=f"📦 {total} 件をZIPでまとめてダウンロード",
-                    data=zip_buf.getvalue(),
-                    file_name="気象レポート_処理済み.zip",
-                    mime="application/zip"
+                    label="📥 ハイライト済PDF",
+                    data=r["highlighted_bytes"],
+                    file_name=f"{r['base_name']}_ハイライト済.pdf",
+                    mime="application/pdf"
                 )
+            with col2:
+                st.download_button(
+                    label="📥 1時間予報PNG",
+                    data=r["png_bytes"],
+                    file_name=f"{r['base_name']}_1時間予報.png",
+                    mime="image/png"
+                )
+        else:
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for r in results:
+                    zf.writestr(f"{r['base_name']}_ハイライト済.pdf", r["highlighted_bytes"])
+                    zf.writestr(f"{r['base_name']}_1時間予報.png", r["png_bytes"])
+            zip_buf.seek(0)
 
-                with st.expander("📄 個別にダウンロードする"):
-                    for r in results:
-                        st.caption(r["source"])
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.download_button(
-                                label="PDF",
-                                data=r["highlighted_bytes"],
-                                file_name=f"{r['base_name']}_ハイライト済.pdf",
-                                mime="application/pdf",
-                                key=f"pdf_{r['source']}"
-                            )
-                        with col2:
-                            st.download_button(
-                                label="PNG",
-                                data=r["png_bytes"],
-                                file_name=f"{r['base_name']}_1時間予報.png",
-                                mime="image/png",
-                                key=f"png_{r['source']}"
-                            )
+            # 降水量ゼロのファイルがある場合はメッセージ表示
+            zero_files = [r["source"] for r in results if r["cells"] == 0]
+            if zero_files:
+                for fname in zero_files:
+                    st.info(f"{fname}：気象レポートによると72時間以内の雨予報は確認できませんでした")
 
-            # ダウンロード後、次の予報へ進むための大きなクリアボタン
-            st.markdown("")
-            st.button(
-                "🗑️ クリアして次の予報へ",
-                on_click=clear_files,
-                key="clear_bottom"
+            st.download_button(
+                label=f"📦 {total} 件をZIPでまとめてダウンロード",
+                data=zip_buf.getvalue(),
+                file_name="気象レポート_処理済み.zip",
+                mime="application/zip"
             )
+
+            with st.expander("📄 個別にダウンロードする"):
+                for r in results:
+                    st.caption(r["source"])
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.download_button(
+                            label="PDF",
+                            data=r["highlighted_bytes"],
+                            file_name=f"{r['base_name']}_ハイライト済.pdf",
+                            mime="application/pdf",
+                            key=f"pdf_{r['source']}"
+                        )
+                    with col2:
+                        st.download_button(
+                            label="PNG",
+                            data=r["png_bytes"],
+                            file_name=f"{r['base_name']}_1時間予報.png",
+                            mime="image/png",
+                            key=f"png_{r['source']}"
+                        )
+
+        # ダウンロード後、次の予報へ進むための大きなクリアボタン
+        st.markdown("")
+        st.button(
+            "🗑️ クリアして次の予報へ",
+            on_click=clear_files,
+            key="clear_bottom"
+        )
 
 st.divider()
 st.caption("使い方：PDFをアップロード -> 実行 -> ダウンロード -> クリアして次の予報へ")
